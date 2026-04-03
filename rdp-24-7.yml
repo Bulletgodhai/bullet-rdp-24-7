@@ -1,0 +1,388 @@
+name: 🔥 BULLET 24/7 RDP AUTO SCRIPTS
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/25 * * * *'  # Every 25 minutes
+
+jobs:
+  rdp-runner:
+    runs-on: windows-latest
+    timeout-minutes: 340
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: 🔧 RDP Configuration
+        shell: pwsh
+        run: |
+          Write-Host "🔧 Configuring RDP..."
+          
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+          
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+          
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
+          
+          netsh advfirewall firewall delete rule name="Bullet-RDP" 2>$null
+          netsh advfirewall firewall add rule name="Bullet-RDP" `
+            dir=in action=allow protocol=TCP localport=3389
+          
+          Restart-Service -Name TermService -Force
+          Write-Host "✅ RDP configured"
+      
+      - name: 👤 Create bullethu User
+        shell: pwsh
+        run: |
+          Write-Host "👤 Creating user bullethu..."
+          
+          $username = "bullethu"
+          $password = "Bullet@123"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # Remove if exists
+          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name $username -ErrorAction SilentlyContinue
+          }
+          
+          # Create user
+          New-LocalUser -Name $username -Password $securePass `
+            -AccountNeverExpires -PasswordNeverExpires -ErrorAction Stop
+          
+          # Add to groups
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+          
+          Write-Host "✅ User created: $username / $password"
+      
+      - name: 🌐 Tailscale Setup
+        shell: pwsh
+        run: |
+          Write-Host "🌐 Installing Tailscale..."
+          
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installer -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installer -Force
+          
+          Write-Host "✅ Tailscale installed"
+      
+      - name: 🔗 Tailscale Connect
+        shell: pwsh
+        run: |
+          Write-Host "🔗 Connecting to Tailscale..."
+          
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          
+          # Wait for Tailscale
+          $retries = 0
+          while (-not (Test-Path $tsExe) -and $retries -lt 10) {
+              Start-Sleep -Seconds 2
+              $retries++
+          }
+          
+          if (-not (Test-Path $tsExe)) {
+              Write-Error "Tailscale not found"
+              exit 1
+          }
+          
+          # Connect
+          & $tsExe up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} `
+            --hostname=bullet-rdp-${{ github.run_number }}
+          
+          # Get IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 15) {
+              $tsIP = & $tsExe ip -4
+              if ($tsIP) { break }
+              Start-Sleep -Seconds 3
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Failed to get IP"
+              exit 1
+          }
+          
+          Write-Host "✅ Connected: $tsIP"
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: 🐍 Python Setup
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: 📦 Install Dependencies
+        shell: pwsh
+        run: |
+          Write-Host "📦 Installing Python packages..."
+          python -m pip install --upgrade pip --quiet
+          pip install requests user-agent cfonts colorama --quiet
+          Write-Host "✅ Dependencies installed"
+      
+      - name: 📥 Restore Previous State
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Write-Host "📥 Checking for previous state files..."
+          
+          # Check if state files exist in repo
+          $stateFiles = @(
+              "4L_checker.state",
+              "eurex_fast.state", 
+              "speedxeurex.state"
+          )
+          
+          $restored = 0
+          foreach ($file in $stateFiles) {
+              if (Test-Path $file) {
+                  Write-Host "✅ Found: $file"
+                  $restored++
+              }
+          }
+          
+          if ($restored -gt 0) {
+              Write-Host "✅ Restored $restored state file(s)"
+          } else {
+              Write-Host "ℹ️ No previous state (first run)"
+          }
+      
+      - name: 🔐 Inject Telegram Secrets
+        shell: pwsh
+        run: |
+          Write-Host "🔐 Injecting Telegram credentials..."
+          
+          $token = "${{ secrets.TG_TOKEN }}"
+          $chatId = "${{ secrets.TG_ID }}"
+          
+          if (-not $token -or -not $chatId) {
+              Write-Warning "⚠️ Telegram secrets not set!"
+          }
+          
+          # Fix 4L script
+          if (Test-Path "4L__2___1_.py") {
+              $content = Get-Content "4L__2___1_.py" -Raw -Encoding UTF8
+              $content = $content -replace "os\.getenv\('TG_TOKEN'\)", "'$token'"
+              $content = $content -replace "os\.getenv\('TG_ID'\)", "'$chatId'"
+              $content = $content -replace '\$\{TOKEN\}', $token
+              $content = $content -replace '\$\{CHAT_ID\}', $chatId
+              $content = $content -replace 'TOKEN', 'token'
+              $content = $content -replace 'CHAT_ID', 'chat_id'
+              [System.IO.File]::WriteAllText("4L__2___1_.py", $content, [System.Text.Encoding]::UTF8)
+              Write-Host "✅ Updated 4L__2___1_.py"
+          }
+          
+          # Fix EUREX FAST script
+          if (Test-Path "𝐄𝐔𝐑𝐄𝐗_𝐅𝐀𝐒𝐓_𝐅𝐈𝐋𝐄__1_.py") {
+              $content = Get-Content "𝐄𝐔𝐑𝐄𝐗_𝐅𝐀𝐒𝐓_𝐅𝐈𝐋𝐄__1_.py" -Raw -Encoding UTF8
+              $content = $content -replace "os\.getenv\('TG_TOKEN'\)", "'$token'"
+              $content = $content -replace "os\.getenv\('TG_ID'\)", "'$chatId'"
+              [System.IO.File]::WriteAllText("𝐄𝐔𝐑𝐄𝐗_𝐅𝐀𝐒𝐓_𝐅𝐈𝐋𝐄__1_.py", $content, [System.Text.Encoding]::UTF8)
+              Write-Host "✅ Updated EUREX script"
+          }
+          
+          # Fix speedxeurex script
+          if (Test-Path "speedxeurex.py") {
+              $content = Get-Content "speedxeurex.py" -Raw -Encoding UTF8
+              # Add token/chatId at top if not present
+              if ($content -notmatch "token\s*=\s*['\"]") {
+                  $newContent = "import os`ntoken = '$token'`nchat_id = '$chatId'`n`n" + $content
+                  [System.IO.File]::WriteAllText("speedxeurex.py", $newContent, [System.Text.Encoding]::UTF8)
+              }
+              Write-Host "✅ Updated speedxeurex.py"
+          }
+          
+          Write-Host "✅ All scripts updated with Telegram secrets"
+      
+      - name: 🚀 Start Python Scripts
+        shell: pwsh
+        run: |
+          Write-Host "`n🚀 Starting Python scripts in background..."
+          
+          # Script 1: 4L Checker
+          if (Test-Path "4L__2___1_.py") {
+              $proc1 = Start-Process python -ArgumentList "4L__2___1_.py" `
+                -WindowStyle Hidden -PassThru
+              Write-Host "✅ Started: 4L Checker (PID: $($proc1.Id))"
+          }
+          
+          # Script 2: EUREX Fast
+          if (Test-Path "𝐄𝐔𝐑𝐄𝐗_𝐅𝐀𝐒𝐓_𝐅𝐈𝐋𝐄__1_.py") {
+              $proc2 = Start-Process python -ArgumentList "𝐄𝐔𝐑𝐄𝐗_𝐅𝐀𝐒𝐓_𝐅𝐈𝐋𝐄__1_.py" `
+                -WindowStyle Hidden -PassThru
+              Write-Host "✅ Started: EUREX Fast (PID: $($proc2.Id))"
+          }
+          
+          # Script 3: SpeedXEurex
+          if (Test-Path "speedxeurex.py") {
+              $proc3 = Start-Process python -ArgumentList "speedxeurex.py" `
+                -WindowStyle Hidden -PassThru
+              Write-Host "✅ Started: SpeedXEurex (PID: $($proc3.Id))"
+          }
+          
+          Start-Sleep -Seconds 5
+          
+          # Verify scripts are running
+          $pythonProcs = @(Get-Process python* -ErrorAction SilentlyContinue)
+          Write-Host "`n📊 Running Python processes: $($pythonProcs.Count)"
+          
+          Write-Host "`n✅ All scripts started successfully!"
+      
+      - name: 📺 Display Connection Info
+        shell: pwsh
+        run: |
+          Write-Host "`n$('='*70)"
+          Write-Host "🔥 BULLET 24/7 RDP - ACTIVE" -ForegroundColor Green
+          Write-Host "$('='*70)"
+          Write-Host "🌐 Tailscale IP : $env:TAILSCALE_IP" -ForegroundColor Cyan
+          Write-Host "👤 Username     : bullethu" -ForegroundColor Yellow
+          Write-Host "🔑 Password     : Bullet@123" -ForegroundColor Yellow
+          Write-Host "⚡ Port         : 3389" -ForegroundColor Magenta
+          Write-Host "$('='*70)"
+          Write-Host "🐍 Python Scripts: RUNNING (3 scripts)" -ForegroundColor Green
+          Write-Host "💾 State Files   : AUTO-SAVING" -ForegroundColor Green
+          Write-Host "🔄 Auto-Restart  : Every 25 minutes" -ForegroundColor Green
+          Write-Host "$('='*70)`n"
+      
+      - name: 💾 Auto-Save State Loop
+        shell: pwsh
+        run: |
+          $startTime = Get-Date
+          $maxMinutes = 330  # 5.5 hours (leave time for cleanup)
+          $saveInterval = 300  # Save every 5 minutes
+          
+          Write-Host "🔄 Starting keep-alive loop..."
+          Write-Host "⏱️  Runtime: $maxMinutes minutes"
+          Write-Host "💾 Auto-save: Every 5 minutes`n"
+          
+          $lastSave = Get-Date
+          
+          while ($true) {
+              $elapsed = ((Get-Date) - $startTime).TotalMinutes
+              
+              # Check timeout
+              if ($elapsed -ge $maxMinutes) {
+                  Write-Host "`n⏰ Approaching timeout, saving final state..."
+                  break
+              }
+              
+              # Auto-save every 5 minutes
+              $timeSinceLastSave = ((Get-Date) - $lastSave).TotalSeconds
+              if ($timeSinceLastSave -ge $saveInterval) {
+                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] 💾 Auto-saving state files..."
+                  
+                  # Check for state files
+                  $stateFiles = @(Get-ChildItem -Filter "*.state" -ErrorAction SilentlyContinue)
+                  if ($stateFiles.Count -gt 0) {
+                      Write-Host "  Found $($stateFiles.Count) state file(s)"
+                  }
+                  
+                  $lastSave = Get-Date
+              }
+              
+              # Status every 5 minutes
+              if ([math]::Floor($elapsed) % 5 -eq 0 -and $elapsed -gt 0) {
+                  $remaining = [math]::Floor($maxMinutes - $elapsed)
+                  $pythonCount = @(Get-Process python* -ErrorAction SilentlyContinue).Count
+                  
+                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✅ Active | Elapsed: $([math]::Floor($elapsed))m | Remaining: ${remaining}m | Python: $pythonCount"
+              }
+              
+              Start-Sleep -Seconds 30
+          }
+          
+          Write-Host "`n✅ Keep-alive loop completed"
+      
+      - name: 💾 Commit State Files
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Write-Host "`n💾 Saving state files to repository..."
+          
+          # Configure git
+          git config --global user.email "bullet-bot@actions.github.com"
+          git config --global user.name "Bullet Bot"
+          
+          # Add all state files
+          $stateFiles = @(Get-ChildItem -Filter "*.state" -ErrorAction SilentlyContinue)
+          
+          if ($stateFiles.Count -eq 0) {
+              Write-Host "ℹ️  No state files to save"
+              exit 0
+          }
+          
+          Write-Host "📁 Found $($stateFiles.Count) state file(s):"
+          foreach ($file in $stateFiles) {
+              Write-Host "   - $($file.Name)"
+              git add $file.Name
+          }
+          
+          # Check for changes
+          $status = git status --porcelain
+          if ($status) {
+              git commit -m "💾 Auto-save state - Run #${{ github.run_number }}"
+              
+              # Push with retry
+              $retries = 0
+              $pushed = $false
+              while ($retries -lt 3 -and -not $pushed) {
+                  try {
+                      git push
+                      $pushed = $true
+                      Write-Host "✅ State files pushed to repository"
+                  } catch {
+                      $retries++
+                      Write-Host "⚠️  Push failed, retry $retries/3..."
+                      Start-Sleep -Seconds 5
+                  }
+              }
+              
+              if (-not $pushed) {
+                  Write-Host "⚠️  Failed to push state files"
+              }
+          } else {
+              Write-Host "ℹ️  No changes to commit"
+          }
+      
+      - name: 🔄 Trigger Next Workflow
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Write-Host "`n🔄 Triggering next workflow instance..."
+          
+          $headers = @{
+              Authorization = "token ${{ secrets.GITHUB_TOKEN }}"
+              Accept = "application/vnd.github.v3+json"
+          }
+          
+          $body = @{
+              ref = "${{ github.ref }}"
+          } | ConvertTo-Json
+          
+          try {
+              $repoFullName = "${{ github.repository }}"
+              $workflowFile = "rdp-24-7.yml"
+              
+              $uri = "https://api.github.com/repos/$repoFullName/actions/workflows/$workflowFile/dispatches"
+              
+              Invoke-RestMethod -Uri $uri -Method POST -Headers $headers `
+                -Body $body -ContentType "application/json" -ErrorAction Stop
+              
+              Write-Host "✅ Next workflow triggered successfully!"
+              Write-Host "ℹ️  New workflow will start in ~1-2 minutes"
+          } catch {
+              Write-Host "⚠️  API trigger failed (normal on schedule runs)"
+              Write-Host "ℹ️  Cron schedule will start next instance"
+          }
+          
